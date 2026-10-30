@@ -12,6 +12,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private let hotKeys = HotKeys()
     private lazy var switcher = Switcher(tiler: tiler, hotKeys: hotKeys)
     private let model = AppModel()
+    private lazy var workspaces = Workspaces(tiler: tiler)
+    private lazy var commands = Commands(tiler: tiler, workspaces: workspaces)
+    private lazy var server = CommandServer { [weak self] request, reply in
+        MainActor.assumeIsolated {
+            guard let self else { return reply(["ok": false, "error": "Windy is quitting."]) }
+            self.commands.handle(request, reply: reply)
+        }
+    }
 
     private var statusItem: NSStatusItem!
     private let popover = NSPopover()
@@ -24,14 +32,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.appearance = prefs.appearance.nsAppearance
         model.tiler = tiler
+        model.workspaces = workspaces
         model.showSettings = { [weak self] in self?.showSettings() }
         model.showTour = { [weak self] in self?.showTour() }
 
         tracker.onChange = { [weak self] in self?.tiler.scheduleReconcile() }
         tracker.onGeometry = { [weak self] id in self?.tiler.geometryChanged(id) }
         tracker.onFocus = { [weak self] in self?.tiler.focusChanged() }
+        tracker.onSpaceChange = { [weak self] in self?.tiler.spaceChanged() }
         tiler.onStateChange = { [weak self] in self?.stateChanged() }
 
+        // One Windy at a time: a second copy would fight the first over every window.
+        guard server.start() else {
+            NSApp.terminate(nil)
+            return
+        }
         setUpStatusItem()
         registerShortcuts()
         setUpMonitors()
@@ -39,6 +54,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         if Accessibility.isTrusted { start() } else { waitForAccess() }
         if !prefs.setupDone || !Accessibility.isTrusted { showTour() }
+    }
+
+    func applicationWillTerminate(_ notification: Notification) {
+        server.stop()
     }
 
     private func start() {

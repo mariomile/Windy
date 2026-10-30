@@ -1,55 +1,34 @@
 import AppKit
 import WindyCore
 
-/// One place in a layout. It can hold a stack of windows that share its frame; `top` is the one showing.
-struct Tile {
-    var stack: [CGWindowID]
-    var top: CGWindowID
-
-    init(_ id: CGWindowID) {
-        stack = [id]
-        top = id
-    }
-}
-
-/// The tiles of one display, in the order their windows arrived.
-final class ScreenModel {
-    let uuid: String
-    var tiles: [Tile] = []
-    /// Sizes the user set by dragging or with ⌃⌥=/-, per layout and tile count.
-    var weights: [String: SplitWeights] = [:]
-    /// The window zoomed by focus mode, if any.
-    var focusWindow: CGWindowID?
-
-    init(uuid: String) { self.uuid = uuid }
-
-    func index(of id: CGWindowID) -> Int? { tiles.firstIndex { $0.stack.contains(id) } }
-    var windowCount: Int { tiles.reduce(0) { $0 + $1.stack.count } }
-}
-
+/// Turns the windows on screen into tiles and tiles into window frames.
+/// Tile state lives in `ScreenTiles` (WindyCore), one per display and Space.
 @MainActor
 final class Tiler {
     let tracker: WindowTracker
     let prefs = Prefs.shared
 
-    private(set) var models: [String: ScreenModel] = [:]
-    private(set) var floating: Set<CGWindowID> = []
+    /// Tiles for every display and Space seen. Spaces not showing keep theirs for when you come back.
+    private(set) var models: [ScreenKey: ScreenTiles] = [:]
+    /// The Space showing on each display, by display UUID.
+    private(set) var active: [String: ScreenKey] = [:]
+    private(set) var floating: Set<WindowID> = []
     /// Floating only because their screen was full; they get a tile when one frees up.
-    private var overflow: [CGWindowID] = []
-    private(set) var focused: CGWindowID?
+    private var overflow: [WindowID] = []
+    private(set) var focused: WindowID?
     /// Most recently focused windows first.
-    private(set) var mru: [CGWindowID] = []
+    private(set) var mru: [WindowID] = []
     /// The frame Windy last gave each window.
-    private(set) var assigned: [CGWindowID: CGRect] = [:]
-    private(set) var cleanSpace: (screen: String, window: CGWindowID)?
+    private(set) var assigned: [WindowID: CGRect] = [:]
+    private(set) var cleanSpace: (screen: String, window: WindowID)?
     var noPeek = false { didSet { changed() } }
     var stageManagerOn = false { didSet { if stageManagerOn != oldValue { reconcile() } } }
 
     var onStateChange: (() -> Void)?
 
-    private var ownChangeUntil: [CGWindowID: Date] = [:]
-    private var lastSnapBack: [CGWindowID: Date] = [:]
-    private var dragged: Set<CGWindowID> = []
+    private var ownChangeUntil: [WindowID: Date] = [:]
+    private var lastSnapBack: [WindowID: Date] = [:]
+    private var dragged: Set<WindowID> = []
     private var reconcileScheduled = false
 
     init(tracker: WindowTracker) {
@@ -60,8 +39,41 @@ final class Tiler {
         prefs.tilingEnabled && prefs.setupDone && Accessibility.isTrusted && !stageManagerOn
     }
 
-    var tiledCount: Int { models.values.reduce(0) { $0 + $1.windowCount } }
     var gap: CGFloat { CGFloat(prefs.gap) }
+
+    // MARK: Reading state
+
+    func tiles(onDisplay uuid: String) -> ScreenTiles? { active[uuid].flatMap { models[$0] } }
+
+    var activeTiles: [ScreenTiles] { active.values.compactMap { models[$0] } }
+
+    var tiledCount: Int { activeTiles.reduce(0) { $0 + $1.windowCount } }
+
+    /// The display and tile holding a window, on the Spaces showing now.
+    func locate(_ id: WindowID) -> (display: String, tile: Int)? {
+        for (display, key) in active {
+            if let i = models[key]?.index(of: id) { return (display, i) }
+        }
+        return nil
+    }
+
+    var isFocusMode: Bool {
+        guard let display = focusedLocation?.display else { return false }
+        return tiles(onDisplay: display)?.zoomed != nil
+    }
+
+    func hasCustomSizes(_ uuid: String) -> Bool { !(tiles(onDisplay: uuid)?.weights.isEmpty ?? true) }
+
+    private func edit<T>(_ display: String, _ body: (inout ScreenTiles) -> T) -> T? {
+        guard let key = active[display] else { return nil }
+        return body(&models[key, default: ScreenTiles()])
+    }
+
+    func capacity(_ display: String) -> Int {
+        let layout = prefs.layout(for: display)
+        let shape = NSScreen.with(uuid: display)?.shape ?? .normal
+        return min(max(1, layout.count), Layout.capacity(layout.kind, shape: shape))
+    }
 
     // MARK: Keeping tiles in sync with the windows on screen
 
@@ -74,20 +86,56 @@ final class Tiler {
         }
     }
 
+    /// Follows the Space showing on each display. Tiles of a display that goes away (sleep,
+    /// clamshell, a resolution change) are kept for when it comes back.
+    private func refreshActive() {
+        let screens = NSScreen.screens
+        active = Dictionary(uniqueKeysWithValues: screens.map { ($0.uuid, $0.key) })
+        for key in active.values where models[key] == nil { models[key] = ScreenTiles() }
+
+        // A window belongs to one showing screen only: the one it's on.
+        var owners: [WindowID: [String]] = [:]
+        for (display, key) in active { for id in models[key]!.windows { owners[id, default: []].append(display) } }
+        for (id, displays) in owners where displays.count > 1 {
+            let here = tracker.windows[id].flatMap { screen(for: $0) }?.uuid
+            let keep = displays.contains(here ?? "") ? here! : displays.sorted()[0]
+            for display in displays where display != keep { models[active[display]!]!.remove(id) }
+        }
+    }
+
+    // MARK: Spaces
+
+    /// Right after a Space switch both Spaces' windows can still be listed as on screen.
+    /// Reconciling waits for the switch to settle so neither Space's tiles get mixed up.
+    private var settleUntil = Date.distantPast
+
+    func spaceChanged() {
+        settleUntil = Date().addingTimeInterval(0.5)
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in self?.tracker.scanAll() }
+    }
+
     /// Drops closed windows, adds new ones and re-applies every screen that changed.
     func reconcile() {
+        let wait = settleUntil.timeIntervalSinceNow
+        if wait > 0 {
+            if !reconcileScheduled {
+                reconcileScheduled = true
+                DispatchQueue.main.asyncAfter(deadline: .now() + wait) { [weak self] in
+                    self?.reconcileScheduled = false
+                    self?.reconcile()
+                }
+            }
+            return
+        }
         guard isActive else {
             models.removeAll()
+            active.removeAll()
             assigned.removeAll()
             cleanSpace = nil
             changed()
             return
         }
-
-        let screens = NSScreen.screens
-        let uuids = Set(screens.map(\.uuid))
-        for uuid in models.keys where !uuids.contains(uuid) { models[uuid] = nil }
-        for screen in screens where models[screen.uuid] == nil { models[screen.uuid] = ScreenModel(uuid: screen.uuid) }
+        refreshActive()
 
         let visible = tracker.visibleWindows().filter { !prefs.isExcluded($0.bundleID) }
         let ids = Set(visible.map(\.id))
@@ -97,48 +145,49 @@ final class Tiler {
 
         // Native tabs swap which window ID is on screen. A newcomer from the same app sitting
         // where a vanished window was takes over its slot instead of moving to the end.
-        var tiledNow = Set(models.values.flatMap { $0.tiles.flatMap(\.stack) })
+        let tiledNow = Set(activeTiles.flatMap(\.windows))
         var newcomers = visible.filter { !tiledNow.contains($0.id) && !floating.contains($0.id) }
-        for model in models.values {
-            for gone in model.tiles.flatMap(\.stack) where !ids.contains(gone) {
+        for (display, key) in active {
+            for gone in models[key]!.windows where !ids.contains(gone) {
                 guard let slot = assigned[gone], let pid = tracker.windows[gone]?.pid,
                       let k = newcomers.firstIndex(where: { w in
                           w.pid == pid && (w.element.frame.map { abs($0.minX - slot.minX) < 30 && abs($0.minY - slot.minY) < 30 } ?? false)
-                      }),
-                      let i = model.index(of: gone) else { continue }
+                      }) else { continue }
                 let id = newcomers.remove(at: k).id
-                model.tiles[i].stack = model.tiles[i].stack.map { $0 == gone ? id : $0 }
-                if model.tiles[i].top == gone { model.tiles[i].top = id }
-                if model.focusWindow == gone { model.focusWindow = id }
-                if cleanSpace?.window == gone { cleanSpace = (model.uuid, id) }
+                models[key]!.replace(gone, with: id)
+                if cleanSpace?.window == gone { cleanSpace = (display, id) }
                 assigned[id] = slot
                 assigned[gone] = nil
-                tiledNow.insert(id)
-                dirty.insert(model.uuid)
+                dirty.insert(display)
             }
         }
 
-        for model in models.values {
-            for id in model.tiles.flatMap(\.stack) where !ids.contains(id) {
-                remove(id, from: model, raiseNext: false)
-                dirty.insert(model.uuid)
+        for (display, key) in active {
+            for id in models[key]!.windows where !ids.contains(id) {
+                assigned[id] = nil
+                models[key]!.remove(id)
+                if cleanSpace?.window == id { cleanSpace = nil }
+                dirty.insert(display)
             }
             // Layout or count may have changed in Settings: stack or unstack to fit.
-            if fit(model) { dirty.insert(model.uuid) }
+            if fit(display) { dirty.insert(display) }
         }
         if let clean = cleanSpace, !ids.contains(clean.window) {
             cleanSpace = nil
             dirty.insert(clean.screen)
         }
 
-        let tiled = Set(models.values.flatMap { $0.tiles.flatMap(\.stack) })
+        let tiled = Set(activeTiles.flatMap(\.windows))
+        let showing = Set(active.values)
         for window in visible where !tiled.contains(window.id) && !floating.contains(window.id) {
-            guard let screen = screen(for: window), let model = models[screen.uuid] else { continue }
-            add(window.id, to: model)
-            dirty.insert(model.uuid)
+            guard let screen = screen(for: window), active[screen.uuid] != nil else { continue }
+            // A window brought here from another Space leaves that Space's tiles.
+            for key in models.keys where !showing.contains(key) { models[key]!.remove(window.id) }
+            add(window.id, on: screen.uuid)
+            dirty.insert(screen.uuid)
         }
 
-        for uuid in dirty { apply(uuid) }
+        for display in dirty { apply(display) }
         changed()
     }
 
@@ -147,114 +196,122 @@ final class Tiler {
         return NSScreen.containing(axPoint: CGPoint(x: frame.midX, y: frame.midY))
     }
 
-    func capacity(_ model: ScreenModel) -> Int {
-        let layout = prefs.layout(for: model.uuid)
-        let shape = NSScreen.with(uuid: model.uuid)?.shape ?? .normal
-        return min(max(1, layout.count), Layout.capacity(layout.kind, shape: shape))
-    }
-
-    private func add(_ id: CGWindowID, to model: ScreenModel) {
-        if model.tiles.count < capacity(model) {
-            model.tiles.append(Tile(id))
-        } else if prefs.stackWhenFull {
-            // A full screen stacks the new window on top of the tile you're working in.
-            let i = activeTile(in: model) ?? model.tiles.count - 1
-            model.tiles[i].stack.append(id)
-            model.tiles[i].top = id
-        } else {
+    private func add(_ id: WindowID, on display: String) {
+        let activeTile = mru.lazy.compactMap { self.tiles(onDisplay: display)?.index(of: $0) }.first
+        let outcome = edit(display) {
+            $0.add(id, capacity: capacity(display), stackWhenFull: prefs.stackWhenFull, activeTile: activeTile)
+        }
+        if outcome == .full {
             floating.insert(id)
             overflow.append(id)
-            center(id, on: model.uuid)
+            center(id, on: display)
         }
     }
 
-    private func activeTile(in model: ScreenModel) -> Int? {
-        for id in mru { if let i = model.index(of: id) { return i } }
-        return nil
-    }
-
-    private func remove(_ id: CGWindowID, from model: ScreenModel, raiseNext: Bool = true) {
+    private func remove(_ id: WindowID, from display: String, raiseNext: Bool = true) {
         assigned[id] = nil
-        if model.focusWindow == id { model.focusWindow = nil }
         if cleanSpace?.window == id { cleanSpace = nil }
-        guard let i = model.index(of: id) else { return }
-        model.tiles[i].stack.removeAll { $0 == id }
-        if model.tiles[i].stack.isEmpty {
-            model.tiles.remove(at: i)
-            unstackIfRoom(model)
-        } else if model.tiles[i].top == id {
-            let next = model.tiles[i].stack.last!
-            model.tiles[i].top = next
-            if raiseNext { tracker.windows[next]?.element.perform(kAXRaiseAction) }
-        }
+        let next = edit(display) { $0.remove(id) } ?? nil
+        if raiseNext, let next { tracker.windows[next]?.element.perform(kAXRaiseAction) }
+        fit(display)
     }
 
-    /// When a tile frees up, a window waiting in a stack, or floating because the screen was full,
-    /// gets its own place.
-    private func unstackIfRoom(_ model: ScreenModel) {
-        while model.tiles.count < capacity(model), let j = model.tiles.lastIndex(where: { $0.stack.count > 1 }) {
-            let waiting = model.tiles[j].stack.first { $0 != model.tiles[j].top }!
-            model.tiles[j].stack.removeAll { $0 == waiting }
-            model.tiles.append(Tile(waiting))
-        }
-        while model.tiles.count < capacity(model), let k = overflow.firstIndex(where: { id in
-            tracker.windows[id].flatMap { screen(for: $0) }?.uuid == model.uuid
-        }) {
-            let id = overflow.remove(at: k)
-            floating.remove(id)
-            model.tiles.append(Tile(id))
-        }
-    }
-
-    /// Stacks extra tiles or unstacks waiting windows so a screen matches its window count.
-    /// Returns whether anything moved.
+    /// Stacks or unstacks so a screen matches its window count, pulling in windows that floated
+    /// because it was full. Returns whether anything moved.
     @discardableResult
-    private func fit(_ model: ScreenModel) -> Bool {
-        let before = model.tiles.map(\.stack)
-        let cap = capacity(model)
-        while model.tiles.count > cap {
-            let extra = model.tiles.removeLast()
-            model.tiles[model.tiles.count - 1].stack.insert(contentsOf: extra.stack, at: 0)
+    private func fit(_ display: String) -> Bool {
+        let cap = capacity(display)
+        let waiting = overflow.filter { id in
+            tracker.windows[id].flatMap { screen(for: $0) }?.uuid == display
         }
-        unstackIfRoom(model)
-        return model.tiles.map(\.stack) != before
-    }
-
-    func locate(_ id: CGWindowID) -> (model: ScreenModel, tile: Int)? {
-        for model in models.values { if let i = model.index(of: id) { return (model, i) } }
-        return nil
+        guard let key = active[display], var tiles = models[key] else { return false }
+        let before = tiles.tiles.map(\.stack)
+        tiles.trim(capacity: cap)
+        tiles.fill(capacity: cap)
+        // A waiting window comes back only if the screen can make room for it.
+        var taken: [WindowID] = []
+        for id in waiting {
+            var trial = tiles
+            guard trial.fill(capacity: cap, waiting: [id]) == [id], fits(trial, on: display) else { continue }
+            tiles = trial
+            taken.append(id)
+        }
+        models[key] = tiles
+        for id in taken {
+            overflow.removeAll { $0 == id }
+            floating.remove(id)
+        }
+        return tiles.tiles.map(\.stack) != before
     }
 
     // MARK: Placing windows
 
-    private func tree(for model: ScreenModel, on screen: NSScreen) -> (LayoutNode, String) {
-        let layout = prefs.layout(for: model.uuid)
-        let n = max(1, model.tiles.count)
+    private func tree(for tiles: ScreenTiles, display: String, on screen: NSScreen) -> (LayoutNode, String) {
+        let layout = prefs.layout(for: display)
+        let n = max(1, tiles.tiles.count)
         let tree = Layout.tree(kind: layout.kind, count: n, mainRatio: prefs.mainSize.ratio, shape: screen.shape)
         return (tree, "\(layout.kind.rawValue)-\(n)")
     }
 
-    /// Moves every window on a screen to its tile.
-    func apply(_ uuid: String) {
-        guard isActive, let model = models[uuid], let screen = NSScreen.with(uuid: uuid) else {
-            changed()
-            return
-        }
-        // A zoomed window that left this screen (swap, move, float) ends its zoom.
-        if let zoomed = model.focusWindow, model.index(of: zoomed) == nil { model.focusWindow = nil }
-        if let clean = cleanSpace, clean.screen == uuid, model.index(of: clean.window) == nil { cleanSpace = nil }
-        guard !model.tiles.isEmpty else {
-            changed()
-            return
-        }
-        let area = screen.axVisibleFrame
-        let full = area.insetBy(dx: gap, dy: gap)
-        let (tree, key) = tree(for: model, on: screen)
-        let leaves = Layout.rects(tree, in: area, gap: gap, weights: model.weights[key] ?? [:]).leaves
-        let zoomed = cleanSpace?.screen == uuid ? cleanSpace?.window : model.focusWindow
+    private func appKey(_ id: WindowID) -> String? {
+        tracker.windows[id].map { $0.bundleID ?? $0.appName }
+    }
 
-        var placed: [CGWindowID] = []
-        for (i, tile) in model.tiles.enumerated() {
+    private func fits(_ tiles: ScreenTiles, on display: String) -> Bool {
+        guard let screen = NSScreen.with(uuid: display), !tiles.tiles.isEmpty else { return true }
+        let (tree, key) = tree(for: tiles, display: display, on: screen)
+        return Layout.constrain(tree, in: screen.axVisibleFrame, gap: gap,
+                                weights: tiles.weights[key] ?? [:], mins: minimums(tiles)) != nil
+    }
+
+    /// The smallest size each tile can take, from what its apps have refused before.
+    private func minimums(_ tiles: ScreenTiles) -> [Int: CGSize] {
+        var out: [Int: CGSize] = [:]
+        for (i, tile) in tiles.tiles.enumerated() {
+            for id in tile.stack {
+                guard let app = appKey(id), let m = prefs.minSizes[app] else { continue }
+                let old = out[i] ?? .zero
+                out[i] = CGSize(width: max(old.width, m.width), height: max(old.height, m.height))
+            }
+        }
+        return out
+    }
+
+    /// Moves every window on a screen to its tile.
+    func apply(_ display: String) {
+        guard isActive, let key = active[display], let screen = NSScreen.with(uuid: display) else {
+            changed()
+            return
+        }
+        if let clean = cleanSpace, clean.screen == display, models[key]?.contains(clean.window) != true { cleanSpace = nil }
+        let area = screen.axVisibleFrame
+
+        // Split lines move to give apps the room they need. If they can't all fit,
+        // the newest window with a known minimum floats until they do.
+        var leaves: [Int: CGRect] = [:]
+        while let tiles = models[key], !tiles.tiles.isEmpty {
+            let (tree, weightKey) = tree(for: tiles, display: display, on: screen)
+            let weights = tiles.weights[weightKey] ?? [:]
+            if let fitted = Layout.constrain(tree, in: area, gap: gap, weights: weights, mins: minimums(tiles)) {
+                leaves = Layout.rects(tree, in: area, gap: gap, weights: fitted).leaves
+                break
+            }
+            guard let victim = tiles.tiles.reversed().flatMap({ $0.stack.reversed() })
+                .first(where: { appKey($0).flatMap { prefs.minSizes[$0] } != nil }) else { break }
+            models[key]!.remove(victim)
+            floating.insert(victim)
+            overflow.append(victim)
+            center(victim, on: display)
+        }
+        guard let tiles = models[key], !tiles.tiles.isEmpty else {
+            changed()
+            return
+        }
+
+        let zoomed = cleanSpace?.screen == display ? cleanSpace?.window : tiles.zoomed
+        let full = area.insetBy(dx: gap, dy: gap)
+        var placed: [WindowID] = []
+        for (i, tile) in tiles.tiles.enumerated() {
             guard let frame = leaves[i] else { continue }
             for id in tile.stack {
                 place(id, id == zoomed ? full : frame)
@@ -266,10 +323,10 @@ final class Tiler {
         changed()
     }
 
-    private func place(_ id: CGWindowID, _ frame: CGRect) {
+    private func place(_ id: WindowID, _ frame: CGRect, force: Bool = false) {
         guard let window = tracker.windows[id] else { return }
         assigned[id] = frame
-        if let current = window.element.frame,
+        if !force, let current = window.element.frame,
            abs(current.minX - frame.minX) < 1, abs(current.minY - frame.minY) < 1,
            abs(current.width - frame.width) < 1, abs(current.height - frame.height) < 1 { return }
         ownChangeUntil[id] = Date().addingTimeInterval(0.6)
@@ -282,27 +339,46 @@ final class Tiler {
         if enhanced { app.set("AXEnhancedUserInterface", true as CFBoolean) }
     }
 
-    /// Windows that refuse to get as small as their tile float in the middle of the screen instead.
-    private func checkFit(_ ids: [CGWindowID]) {
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) { [weak self] in
-            guard let self else { return }
-            var refloated = Set<String>()
-            for id in ids {
-                guard let target = assigned[id], let window = tracker.windows[id], let actual = window.element.frame,
-                      let (model, _) = locate(id), model.focusWindow != id, cleanSpace?.window != id else { continue }
-                if actual.width > target.width + 30 || actual.height > target.height + 30 {
-                    remove(id, from: model)
-                    floating.insert(id)
-                    center(id, on: model.uuid)
-                    refloated.insert(model.uuid)
-                }
+    /// A window bigger than its tile gets put back twice more. Only if it holds the same size
+    /// through all three tries (an app restoring its saved size or animating doesn't) does Windy
+    /// learn the app's minimum and move the split lines to make room.
+    private func checkFit(_ ids: [WindowID], attempt: Int = 1, seen: [WindowID: CGSize] = [:]) {
+        DispatchQueue.main.asyncAfter(deadline: .now() + (attempt == 1 ? 0.35 : 0.6)) { [weak self] in
+            guard let self, NSEvent.pressedMouseButtons == 0 else { return }
+            var sizes: [WindowID: CGSize] = [:]
+            for id in ids where !dragged.contains(id) && isTooBig(id) {
+                guard let size = tracker.windows[id]?.element.frame?.size else { continue }
+                if let earlier = seen[id], abs(earlier.width - size.width) > 4 || abs(earlier.height - size.height) > 4 { continue }
+                if attempt == 1 || seen[id] != nil { sizes[id] = size }
             }
-            for uuid in refloated { apply(uuid) }
+            guard !sizes.isEmpty else { return }
+            if attempt < 3 {
+                for id in sizes.keys { if let frame = assigned[id] { place(id, frame, force: true) } }
+                checkFit(Array(sizes.keys), attempt: attempt + 1, seen: sizes)
+                return
+            }
+            var displays = Set<String>()
+            for (id, size) in sizes {
+                guard let target = assigned[id], let app = appKey(id), let (display, _) = locate(id),
+                      let area = NSScreen.with(uuid: display)?.axVisibleFrame else { continue }
+                // Never more than three quarters of the screen: past that, floating is the right answer anyway.
+                let width = size.width > target.width + 8 ? min(size.width, area.width * 0.75) : 0
+                let height = size.height > target.height + 8 ? min(size.height, area.height * 0.75) : 0
+                prefs.learnMinSize(app, CGSize(width: width, height: height))
+                displays.insert(display)
+            }
+            for display in displays { apply(display) }
         }
     }
 
-    private func center(_ id: CGWindowID, on uuid: String) {
-        guard let window = tracker.windows[id], let screen = NSScreen.with(uuid: uuid),
+    private func isTooBig(_ id: WindowID) -> Bool {
+        guard let target = assigned[id], let actual = tracker.windows[id]?.element.frame,
+              let (display, _) = locate(id), tiles(onDisplay: display)?.zoomed != id, cleanSpace?.window != id else { return false }
+        return actual.width > target.width + 8 || actual.height > target.height + 8
+    }
+
+    private func center(_ id: WindowID, on display: String) {
+        guard let window = tracker.windows[id], let screen = NSScreen.with(uuid: display),
               let frame = window.element.frame else { return }
         let area = screen.axVisibleFrame
         let size = CGSize(width: min(frame.width, area.width), height: min(frame.height, area.height))
@@ -313,7 +389,12 @@ final class Tiler {
     }
 
     func applyAll() {
-        for uuid in models.keys { apply(uuid) }
+        for display in active.keys { apply(display) }
+    }
+
+    func forgetMinSizes() {
+        prefs.minSizes = [:]
+        applyAll()
     }
 
     private func changed() {
@@ -331,29 +412,31 @@ final class Tiler {
         mru.insert(id, at: 0)
         if mru.count > 64 { mru.removeLast() }
 
-        if let (model, i) = locate(id) {
-            model.tiles[i].top = id
-            // Clicking another window on a zoomed screen goes back to the layout.
-            if let zoomed = model.focusWindow, zoomed != id {
-                model.focusWindow = nil
-                apply(model.uuid)
-            }
+        if let (display, i) = locate(id) {
+            let zoomedOther = edit(display) { s -> Bool in
+                s.tiles[i].top = id
+                // Clicking another window on a zoomed screen goes back to the layout.
+                guard let z = s.zoomed, z != id else { return false }
+                s.zoomed = nil
+                return true
+            } ?? false
+            if zoomedOther { apply(display) }
             // Clean Space shows whichever window you bring forward on that screen.
-            if let clean = cleanSpace, clean.screen == model.uuid, clean.window != id {
-                cleanSpace = (clean.screen, id)
-                apply(model.uuid)
+            if let clean = cleanSpace, clean.screen == display, clean.window != id {
+                cleanSpace = (display, id)
+                apply(display)
             }
         }
         changed()
     }
 
-    func focus(_ id: CGWindowID) {
+    func focus(_ id: WindowID) {
         tracker.windows[id]?.focus()
     }
 
     // MARK: User moving and resizing windows
 
-    func geometryChanged(_ id: CGWindowID) {
+    func geometryChanged(_ id: WindowID) {
         if let until = ownChangeUntil[id], until > Date(),
            let frame = tracker.windows[id]?.element.frame, let target = assigned[id] ?? Optional(frame),
            abs(frame.minX - target.minX) < 2, abs(frame.minY - target.minY) < 2,
@@ -370,7 +453,7 @@ final class Tiler {
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { [weak self] in
             guard let self else { return }
             reconcile()
-            if let (model, _) = locate(id) { apply(model.uuid) }
+            if let (display, _) = locate(id) { apply(display) }
         }
     }
 
@@ -381,96 +464,98 @@ final class Tiler {
         for id in ids { finishDrag(id, modifiers: modifiers) }
     }
 
-    private func finishDrag(_ id: CGWindowID, modifiers: NSEvent.ModifierFlags) {
+    private func finishDrag(_ id: WindowID, modifiers: NSEvent.ModifierFlags) {
         guard let window = tracker.windows[id], let frame = window.element.frame,
-              let (model, i) = locate(id), let old = assigned[id] else { return }
+              let (display, i) = locate(id), let old = assigned[id], let tiles = tiles(onDisplay: display) else { return }
 
         let resized = abs(frame.width - old.width) > 2 || abs(frame.height - old.height) > 2
         if resized {
-            if model.focusWindow == nil, cleanSpace?.window != id, let screen = NSScreen.with(uuid: model.uuid) {
-                let (tree, key) = tree(for: model, on: screen)
-                model.weights[key] = Layout.fit(i, to: frame, tree: tree, in: screen.axVisibleFrame, gap: gap,
-                                                weights: model.weights[key] ?? [:])
+            if tiles.zoomed == nil, cleanSpace?.window != id, let screen = NSScreen.with(uuid: display) {
+                let (tree, key) = tree(for: tiles, display: display, on: screen)
+                let weights = Layout.fit(i, to: frame, tree: tree, in: screen.axVisibleFrame, gap: gap,
+                                         weights: tiles.weights[key] ?? [:])
+                edit(display) { $0.weights[key] = weights }
             }
-            apply(model.uuid)
+            apply(display)
             return
         }
 
         let point = flippedPoint(NSEvent.mouseLocation)
-        guard let screen = NSScreen.containing(axPoint: point), let target = models[screen.uuid] else {
-            apply(model.uuid)
+        guard let screen = NSScreen.containing(axPoint: point), let target = self.tiles(onDisplay: screen.uuid) else {
+            apply(display)
             return
         }
+        let other = screen.uuid
         let targetTile = target.tiles.indices.first { j in
-            !(target === model && j == i) && (assigned[target.tiles[j].top]?.contains(point) ?? false)
+            !(other == display && j == i) && (assigned[target.tiles[j].top]?.contains(point) ?? false)
         }
 
         if modifiers.contains(.command), let j = targetTile {
             if modifiers.contains(.option) {
-                addToStack(id, from: model, onto: target.tiles[j].top)
+                addToStack(id, from: display, onto: target.tiles[j].top)
             } else {
-                swapTiles(model, i, target, j)
+                swapTiles(display, i, other, j)
             }
-        } else if target !== model {
-            moveToNewTile(id, from: model, to: target)
+        } else if other != display {
+            moveToNewTile(id, from: display, to: other)
         }
-        apply(model.uuid)
-        if target !== model { apply(target.uuid) }
+        apply(display)
+        if other != display { apply(other) }
     }
 
-    private func swapTiles(_ a: ScreenModel, _ i: Int, _ b: ScreenModel, _ j: Int) {
-        if a === b {
-            a.tiles.swapAt(i, j)
+    private func swapTiles(_ a: String, _ i: Int, _ b: String, _ j: Int) {
+        guard let ka = active[a], let kb = active[b] else { return }
+        if ka == kb {
+            models[ka]!.tiles.swapAt(i, j)
         } else {
-            let t = a.tiles[i]
-            a.tiles[i] = b.tiles[j]
-            b.tiles[j] = t
+            let t = models[ka]!.tiles[i]
+            models[ka]!.tiles[i] = models[kb]!.tiles[j]
+            models[kb]!.tiles[j] = t
+            // A zoomed window that left its screen ends its zoom.
+            for k in [ka, kb] where models[k]!.zoomed.map({ !models[k]!.contains($0) }) == true { models[k]!.zoomed = nil }
         }
     }
 
     @discardableResult
-    private func moveToNewTile(_ id: CGWindowID, from model: ScreenModel, to target: ScreenModel) -> Bool {
-        guard target.tiles.count < capacity(target) else { return false }
-        remove(id, from: model)
-        target.tiles.append(Tile(id))
+    private func moveToNewTile(_ id: WindowID, from display: String, to target: String) -> Bool {
+        guard let count = tiles(onDisplay: target)?.tiles.count, count < capacity(target) else { return false }
+        remove(id, from: display)
+        edit(target) { $0.tiles.append(Tile(id)) }
         return true
     }
 
-    private func addToStack(_ id: CGWindowID, from model: ScreenModel, onto top: CGWindowID) {
-        remove(id, from: model)
-        guard let (target, j) = locate(top) else { return }
-        target.tiles[j].stack.append(id)
-        target.tiles[j].top = id
+    private func addToStack(_ id: WindowID, from display: String, onto top: WindowID) {
+        remove(id, from: display)
+        guard let (target, _) = locate(top) else { return }
+        edit(target) { $0.push(id, onto: top) }
     }
 
     // MARK: Commands
 
-    private var focusedLocation: (model: ScreenModel, tile: Int)? {
+    private var focusedLocation: (display: String, tile: Int)? {
         focused.flatMap { locate($0) }
     }
 
     /// The screen commands act on: the active window's, or the one under the pointer.
     var currentScreenUUID: String? {
-        focusedLocation?.model.uuid ?? NSScreen.underPointer?.uuid
+        focusedLocation?.display ?? NSScreen.underPointer?.uuid
     }
 
-    func toggleFocusMode() {
-        guard let id = focused, let (model, _) = locate(id) else { return }
-        model.focusWindow = model.focusWindow == id ? nil : id
-        apply(model.uuid)
+    func toggleFocusMode(_ window: WindowID? = nil) {
+        guard let id = window ?? focused, let (display, _) = locate(id) else { return }
+        edit(display) { $0.zoomed = $0.zoomed == id ? nil : id }
+        apply(display)
     }
 
-    var isFocusMode: Bool { focusedLocation?.model.focusWindow != nil }
-
-    func toggleCleanSpace() {
+    func toggleCleanSpace(_ window: WindowID? = nil) {
         if let clean = cleanSpace {
             cleanSpace = nil
             apply(clean.screen)
             return
         }
-        guard let id = focused, let (model, _) = locate(id) else { return }
-        cleanSpace = (model.uuid, id)
-        apply(model.uuid)
+        guard let id = window ?? focused, let (display, _) = locate(id) else { return }
+        cleanSpace = (display, id)
+        apply(display)
     }
 
     func endCleanSpace() {
@@ -480,99 +565,124 @@ final class Tiler {
     }
 
     func cycleStack(_ step: Int) {
-        guard let (model, i) = focusedLocation, model.tiles[i].stack.count > 1 else { return }
-        let stack = model.tiles[i].stack
-        let k = stack.firstIndex(of: model.tiles[i].top) ?? 0
-        let next = stack[(k + step + stack.count) % stack.count]
-        model.tiles[i].top = next
+        guard let id = focused, let (display, _) = locate(id),
+              let next = edit(display, { $0.cycle(from: id, step: step) }) ?? nil else { return }
         focus(next)
     }
 
-    private func tileRects(_ model: ScreenModel) -> [Int: CGRect] {
+    private func tileRects(_ display: String) -> [Int: CGRect] {
         var out: [Int: CGRect] = [:]
-        for (i, tile) in model.tiles.enumerated() { out[i] = assigned[tile.top] }
+        for (i, tile) in (tiles(onDisplay: display)?.tiles ?? []).enumerated() { out[i] = assigned[tile.top] }
         return out
     }
 
     /// Swaps with the neighbor that way, or moves to the next screen past the edge.
-    func swap(_ direction: Direction) {
-        guard let id = focused, let (model, i) = locate(id), let screen = NSScreen.with(uuid: model.uuid) else { return }
-        let rects = tileRects(model)
+    func swap(_ direction: Direction, window: WindowID? = nil) {
+        guard let id = window ?? focused, let (display, i) = locate(id), let screen = NSScreen.with(uuid: display) else { return }
+        let rects = tileRects(display)
         if let origin = rects[i], let j = Layout.neighbor(of: origin, in: rects, direction: direction) {
-            model.tiles.swapAt(i, j)
-            apply(model.uuid)
+            swapTiles(display, i, display, j)
+            apply(display)
             return
         }
-        guard let next = screen.neighbor(direction), let target = models[next.uuid] else { return }
-        if !moveToNewTile(id, from: model, to: target) {
+        guard let next = screen.neighbor(direction), active[next.uuid] != nil else { return }
+        let target = next.uuid
+        if !moveToNewTile(id, from: display, to: target) {
             // Full screen: trade places with the tile nearest to where the window comes in.
             let origin = assigned[id] ?? .zero
-            let targetRects = tileRects(target)
-            guard let j = targetRects.min(by: {
+            guard let j = tileRects(target).min(by: {
                 hypot($0.value.midX - origin.midX, $0.value.midY - origin.midY)
                     < hypot($1.value.midX - origin.midX, $1.value.midY - origin.midY)
             })?.key else { return }
-            swapTiles(model, i, target, j)
+            swapTiles(display, i, target, j)
         }
-        apply(model.uuid)
-        apply(target.uuid)
+        apply(display)
+        apply(target)
         focus(id)
     }
 
-    func makePrimary() {
-        guard let (model, i) = focusedLocation, i != 0 else { return }
-        model.tiles.swapAt(0, i)
-        apply(model.uuid)
+    func makePrimary(_ window: WindowID? = nil) {
+        guard let (display, i) = (window ?? focused).flatMap({ locate($0) }), i != 0 else { return }
+        swapTiles(display, 0, display, i)
+        apply(display)
     }
 
     func resize(by delta: Double) {
-        guard let (model, i) = focusedLocation, model.focusWindow == nil,
-              let screen = NSScreen.with(uuid: model.uuid) else { return }
-        let (tree, key) = tree(for: model, on: screen)
-        let before = model.weights[key] ?? [:]
+        guard let (display, i) = focusedLocation, let tiles = tiles(onDisplay: display), tiles.zoomed == nil,
+              let screen = NSScreen.with(uuid: display) else { return }
+        let (tree, key) = tree(for: tiles, display: display, on: screen)
+        let before = tiles.weights[key] ?? [:]
         let after = Layout.grow(i, by: delta, tree: tree, weights: before)
         if after == before { NSSound.beep() }
-        model.weights[key] = after
-        apply(model.uuid)
+        edit(display) { $0.weights[key] = after }
+        apply(display)
     }
 
     func resetSizes(_ uuid: String? = nil) {
-        guard let uuid = uuid ?? currentScreenUUID, let model = models[uuid] else { return }
-        model.weights.removeAll()
-        apply(uuid)
+        guard let display = uuid ?? currentScreenUUID else { return }
+        edit(display) { $0.weights.removeAll() }
+        apply(display)
     }
-
-    func hasCustomSizes(_ uuid: String) -> Bool { !(models[uuid]?.weights.isEmpty ?? true) }
 
     func focusNeighbor(_ step: Int) {
-        guard let (model, i) = focusedLocation, model.tiles.count > 1 else { return }
-        focus(model.tiles[(i + step + model.tiles.count) % model.tiles.count].top)
+        guard let (display, i) = focusedLocation, let tiles = tiles(onDisplay: display)?.tiles, tiles.count > 1 else { return }
+        focus(tiles[((i + step) % tiles.count + tiles.count) % tiles.count].top)
     }
 
-    func toggleFloat() {
-        guard let id = focused else { return }
+    func toggleFloat(_ window: WindowID? = nil) {
+        guard let id = window ?? focused else { return }
         overflow.removeAll { $0 == id }
         if floating.contains(id) {
             floating.remove(id)
             reconcile()
-        } else if let (model, _) = locate(id) {
-            remove(id, from: model)
+        } else if let (display, _) = locate(id) {
+            remove(id, from: display)
             floating.insert(id)
-            center(id, on: model.uuid)
-            apply(model.uuid)
+            center(id, on: display)
+            apply(display)
         }
     }
 
     /// Changes a screen's layout or window count, stacking or unstacking windows to fit.
     func setLayout(kind: LayoutKind? = nil, count: Int? = nil, screen uuid: String? = nil) {
-        guard let uuid = uuid ?? currentScreenUUID else { return }
-        var layout = prefs.layout(for: uuid)
+        guard let display = uuid ?? currentScreenUUID else { return }
+        var layout = prefs.layout(for: display)
         if let kind { layout.kind = kind }
-        if let count { layout.count = count }
-        prefs.screenLayouts[uuid] = layout
-        guard let model = models[uuid] else { return }
-        fit(model)
-        apply(uuid)
+        if let count { layout.count = min(5, max(1, count)) }
+        prefs.screenLayouts[display] = layout
+        fit(display)
+        apply(display)
+    }
+
+    /// Gives `windows` the first tiles of a screen, in order. Windows from other screens move over;
+    /// floating ones tile again. Returns the windows that couldn't be placed (minimized, hidden, excluded).
+    @discardableResult
+    func arrange(_ windows: [WindowID], on display: String, kind: LayoutKind? = nil, count: Int? = nil) -> [WindowID] {
+        reconcile()
+        var layout = prefs.layout(for: display)
+        if let kind { layout.kind = kind }
+        if let count { layout.count = min(5, max(1, count)) }
+        prefs.screenLayouts[display] = layout
+        guard active[display] != nil else { return windows }
+
+        let tileable = Set(tracker.visibleWindows().filter { !prefs.isExcluded($0.bundleID) }.map(\.id))
+        var missing: [WindowID] = []
+        var touched: Set<String> = [display]
+        for id in windows {
+            guard tileable.contains(id) else { missing.append(id); continue }
+            floating.remove(id)
+            overflow.removeAll { $0 == id }
+            if let (other, _) = locate(id), other != display {
+                remove(id, from: other, raiseNext: false)
+                touched.insert(other)
+            }
+            if tiles(onDisplay: display)?.contains(id) != true { edit(display) { $0.tiles.append(Tile(id)) } }
+        }
+        let cap = capacity(display)
+        edit(display) { $0.arrange(windows, capacity: cap) }
+        fit(display)
+        for d in touched { apply(d) }
+        return missing
     }
 
     // MARK: Focus follows mouse
@@ -582,10 +692,10 @@ final class Tiler {
     func hover(at point: CGPoint) {
         hoverWork?.cancel()
         guard prefs.focusFollowsMouse, isActive, NSEvent.pressedMouseButtons == 0 else { return }
-        guard let screen = NSScreen.containing(axPoint: point), let model = models[screen.uuid],
-              model.focusWindow == nil, cleanSpace?.screen != screen.uuid else { return }
+        guard let screen = NSScreen.containing(axPoint: point), let tiles = tiles(onDisplay: screen.uuid),
+              tiles.zoomed == nil, cleanSpace?.screen != screen.uuid else { return }
         // Only the window actually under the pointer, and only if it's a tile's top window.
-        guard let target = Self.topWindow(at: point), model.tiles.contains(where: { $0.top == target }),
+        guard let target = Self.topWindow(at: point), tiles.tiles.contains(where: { $0.top == target }),
               target != focused else { return }
         let work = DispatchWorkItem { [weak self] in self?.focus(target) }
         hoverWork = work
@@ -593,7 +703,7 @@ final class Tiler {
     }
 
     /// The frontmost normal window containing an AX point (CG window bounds share AX coordinates).
-    static func topWindow(at point: CGPoint) -> CGWindowID? {
+    static func topWindow(at point: CGPoint) -> WindowID? {
         guard let info = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID)
             as? [[String: Any]] else { return nil }
         for w in info where (w[kCGWindowLayer as String] as? Int) == 0 {

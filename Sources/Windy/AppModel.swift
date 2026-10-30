@@ -42,6 +42,7 @@ final class AppModel {
     var focusMode = false
 
     @ObservationIgnored weak var tiler: Tiler?
+    @ObservationIgnored var workspaces: Workspaces?
     @ObservationIgnored var showSettings: () -> Void = {}
     @ObservationIgnored var showTour: () -> Void = {}
 
@@ -72,12 +73,12 @@ final class AppModel {
             customSizes = tiler.hasCustomSizes(screen.uuid)
         }
         preview = []
-        if let uuid = screenUUID, let model = tiler.models[uuid] {
+        if let uuid = screenUUID, let model = tiler.tiles(onDisplay: uuid) {
             preview = model.tiles.compactMap { tile in
                 guard let frame = tiler.assigned[tile.top] else { return nil }
                 return PreviewTile(id: tile.top, frame: frame, icon: tiler.tracker.windows[tile.top]?.icon,
                                    active: tile.stack.contains(tiler.focused ?? 0),
-                                   zoomed: model.focusWindow == tile.top, stacked: tile.stack.count)
+                                   zoomed: model.zoomed == tile.top, stacked: tile.stack.count)
             }
         }
 

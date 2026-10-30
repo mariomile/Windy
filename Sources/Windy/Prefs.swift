@@ -97,11 +97,17 @@ final class Prefs {
     var noPeekBlur: Bool { didSet { save(noPeekBlur, "noPeekBlur") } }
     var cleanBackground: CleanBackground { didSet { save(cleanBackground.rawValue, "cleanBackground") } }
     var focusFollowsMouse: Bool { didSet { save(focusFollowsMouse, "focusFollowsMouse") } }
+    /// Lets the `windy` command and MCP agents read window titles and move windows. Off until you turn it on.
+    var agentAccess: Bool { didSet { save(agentAccess, "agentAccess") } }
     var appearance: Appearance { didSet { save(appearance.rawValue, "appearance"); NSApp.appearance = appearance.nsAppearance } }
     var prefix: ShortcutPrefix { didSet { save(prefix.rawValue, "prefix") } }
     var excludedApps: [String] { didSet { save(excludedApps, "excludedApps") } }
     var screenLayouts: [String: ScreenLayout] {
         didSet { save(try? JSONEncoder().encode(screenLayouts), "screenLayouts") }
+    }
+    /// The smallest size each app accepted, learned when it refused a smaller tile. Stays on this Mac.
+    var minSizes: [String: CGSize] {
+        didSet { save(minSizes.mapValues { [Double($0.width), Double($0.height)] }, "minSizes") }
     }
 
     private init() {
@@ -127,11 +133,21 @@ final class Prefs {
         noPeekBlur = d.bool(forKey: "noPeekBlur")
         cleanBackground = CleanBackground(rawValue: d.string(forKey: "cleanBackground") ?? "") ?? .graphite
         focusFollowsMouse = d.bool(forKey: "focusFollowsMouse")
+        agentAccess = d.bool(forKey: "agentAccess")
         appearance = Appearance(rawValue: d.string(forKey: "appearance") ?? "") ?? .system
         prefix = ShortcutPrefix(rawValue: d.string(forKey: "prefix") ?? "") ?? .controlOption
         excludedApps = d.stringArray(forKey: "excludedApps") ?? []
         screenLayouts = d.data(forKey: "screenLayouts")
             .flatMap { try? JSONDecoder().decode([String: ScreenLayout].self, from: $0) } ?? [:]
+        minSizes = ((d.dictionary(forKey: "minSizes") as? [String: [Double]]) ?? [:])
+            .compactMapValues { $0.count == 2 ? CGSize(width: $0[0], height: $0[1]) : nil }
+    }
+
+    /// Remembers that an app's windows can't get smaller than `size` in either dimension.
+    func learnMinSize(_ bundleID: String, _ size: CGSize) {
+        let old = minSizes[bundleID] ?? .zero
+        let new = CGSize(width: max(old.width, size.width), height: max(old.height, size.height))
+        if new != old { minSizes[bundleID] = new }
     }
 
     private func save(_ value: Any?, _ key: String) {

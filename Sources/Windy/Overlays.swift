@@ -68,8 +68,8 @@ final class Overlays {
         if tiler.isActive, prefs.highlight != .none, NSEvent.pressedMouseButtons == 0 {
             if let id = tiler.focused, tiler.locate(id) != nil { wanted[id] = true }
             if prefs.highlight == .all {
-                for model in tiler.models.values {
-                    for tile in model.tiles where wanted[tile.top] == nil { wanted[tile.top] = false }
+                for tiles in tiler.activeTiles {
+                    for tile in tiles.tiles where wanted[tile.top] == nil { wanted[tile.top] = false }
                 }
             }
         }

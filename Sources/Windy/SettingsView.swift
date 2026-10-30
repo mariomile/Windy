@@ -13,6 +13,7 @@ struct SettingsView: View {
             HighlightSettings(onChange: onLayoutChange).tabItem { Label("Highlight", systemImage: "square.dashed") }
             AppsSettings(onChange: onLayoutChange).tabItem { Label("Apps", systemImage: "app.badge") }
             KeyboardSettings(onChange: onShortcutsChange).tabItem { Label("Keyboard", systemImage: "keyboard") }
+            AgentSettings().tabItem { Label("Agents", systemImage: "terminal") }
         }
         .frame(width: 520, height: 440)
     }
@@ -62,6 +63,13 @@ private struct LayoutSettings: View {
             Toggle("Stack when the screen is full", isOn: $prefs.stackWhenFull)
             Text("When off, windows that don't fit float in the middle of the screen.")
                 .font(.caption).foregroundStyle(.secondary)
+            LabeledContent("Apps that won't get small") {
+                Button("Forget \(prefs.minSizes.count) learned sizes") {
+                    prefs.minSizes = [:]
+                    onChange()
+                }
+                .disabled(prefs.minSizes.isEmpty)
+            }
         }
         .formStyle(.grouped)
         .onChange(of: prefs.mainSize) { onChange() }
@@ -189,5 +197,80 @@ private struct KeyboardSettings: View {
 
     private func row(_ title: String, _ keys: String) -> some View {
         LabeledContent(title) { Text(keys).font(.body.monospaced()).foregroundStyle(.secondary) }
+    }
+}
+
+/// Puts a `windy` link to this app's binary on the PATH.
+enum CLIInstall {
+    static var binary: String { Bundle.main.executablePath ?? "/Applications/Windy.app/Contents/MacOS/Windy" }
+
+    private static var folders: [String] {
+        let home = FileManager.default.homeDirectoryForCurrentUser.path
+        return ["/opt/homebrew/bin", "/usr/local/bin", "\(home)/.local/bin", "\(home)/bin"]
+    }
+
+    static var installedPath: String? {
+        folders.map { $0 + "/windy" }.first { (try? FileManager.default.destinationOfSymbolicLink(atPath: $0)) != nil }
+    }
+
+    /// Returns what happened, for the Settings window.
+    static func install() -> String {
+        let fm = FileManager.default
+        for folder in folders where fm.isWritableFile(atPath: folder) {
+            let link = folder + "/windy"
+            if (try? fm.destinationOfSymbolicLink(atPath: link)) != nil { try? fm.removeItem(atPath: link) }
+            guard !fm.fileExists(atPath: link) else { continue }
+            if (try? fm.createSymbolicLink(atPath: link, withDestinationPath: binary)) != nil {
+                return "Installed: \(link)"
+            }
+        }
+        return "No writable folder on your PATH. Run in Terminal: sudo ln -sf \"\(binary)\" /usr/local/bin/windy"
+    }
+}
+
+private struct AgentSettings: View {
+    @Bindable var prefs = Prefs.shared
+    @State private var installed = CLIInstall.installedPath
+    @State private var message: String?
+
+    private var mcpCommand: String {
+        "claude mcp add windy -- \"\(installed.map { _ in "windy" } ?? CLIInstall.binary)\" mcp"
+    }
+
+    var body: some View {
+        Form {
+            Section("Command line") {
+                Text("The windy command arranges windows from the terminal, from scripts, and from agents like Claude Code. Run windy help to see everything it does.")
+                    .foregroundStyle(.secondary)
+                Toggle("Allow the windy command and agents", isOn: $prefs.agentAccess)
+                Text("When on, programs you run can list your windows with their titles, move them and open workspaces through Windy.")
+                    .font(.caption).foregroundStyle(.secondary)
+                LabeledContent("windy command") {
+                    if let installed {
+                        Text(installed).font(.body.monospaced()).foregroundStyle(.secondary)
+                    } else {
+                        Button("Install") {
+                            prefs.agentAccess = true
+                            message = CLIInstall.install()
+                            installed = CLIInstall.installedPath
+                        }
+                    }
+                }
+                if let message { Text(message).font(.caption).textSelection(.enabled) }
+            }
+            Section("MCP server") {
+                Text("Let Claude see your screens and arrange windows while it works. Add Windy to Claude Code with:")
+                    .foregroundStyle(.secondary)
+                HStack {
+                    Text(mcpCommand).font(.callout.monospaced()).textSelection(.enabled)
+                    Spacer()
+                    Button("Copy") {
+                        NSPasteboard.general.clearContents()
+                        NSPasteboard.general.setString(mcpCommand, forType: .string)
+                    }
+                }
+            }
+        }
+        .formStyle(.grouped)
     }
 }

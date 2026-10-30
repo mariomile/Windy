@@ -157,6 +157,64 @@ public enum Layout {
         return (leaves, nodes)
     }
 
+    /// Moves split lines so every tile is at least as big as `mins` asks, taking the room from
+    /// neighbors that have some to spare. Returns nil when the screen can't fit them all.
+    public static func constrain(
+        _ tree: LayoutNode, in rect: CGRect, gap: CGFloat, weights: SplitWeights, mins: [Int: CGSize]
+    ) -> SplitWeights? {
+        guard !mins.isEmpty else { return weights }
+
+        func minExtent(_ node: LayoutNode, _ axis: Axis) -> CGFloat {
+            switch node {
+            case let .leaf(i):
+                let m = mins[i] ?? .zero
+                return axis == .horizontal ? m.width : m.height
+            case let .split(a, kids, _):
+                let each = kids.map { minExtent($0, axis) }
+                return a == axis ? each.reduce(0, +) + gap * CGFloat(kids.count - 1) : (each.max() ?? 0)
+            }
+        }
+
+        var out = weights
+        var feasible = true
+
+        func walk(_ node: LayoutNode, _ r: CGRect, _ path: String) {
+            guard feasible, case let .split(axis, kids, defaults) = node else { return }
+            let horizontal = axis == .horizontal
+            let available = max(0, (horizontal ? r.width : r.height) - gap * CGFloat(kids.count - 1))
+            let custom = out[path].flatMap { $0.count == kids.count ? $0 : nil }
+            var extents = normalized(custom ?? defaults).map { available * CGFloat($0) }
+            let needs = kids.map { minExtent($0, axis) }
+            let across = horizontal ? r.height : r.width
+            guard needs.reduce(0, +) <= available + 0.5,
+                  kids.allSatisfy({ minExtent($0, axis.flipped) <= across + 0.5 }) else {
+                feasible = false
+                return
+            }
+
+            let deficit = zip(extents, needs).reduce(0) { $0 + max(0, $1.1 - $1.0) }
+            if deficit > 0.5 {
+                for i in extents.indices where extents[i] < needs[i] { extents[i] = needs[i] }
+                let slack = extents.indices.map { max(0, extents[$0] - needs[$0]) }
+                let totalSlack = slack.reduce(0, +)
+                for i in extents.indices where totalSlack > 0 { extents[i] -= deficit * slack[i] / totalSlack }
+                out[path] = normalized(extents.map(Double.init))
+            }
+
+            var offset: CGFloat = 0
+            for (i, kid) in kids.enumerated() {
+                let kr = horizontal
+                    ? CGRect(x: r.minX + offset, y: r.minY, width: extents[i], height: r.height)
+                    : CGRect(x: r.minX, y: r.minY + offset, width: r.width, height: extents[i])
+                walk(kid, kr, "\(path).\(i)")
+                offset += extents[i] + gap
+            }
+        }
+
+        walk(tree, rect.insetBy(dx: gap, dy: gap), "r")
+        return feasible ? out : nil
+    }
+
     /// The split nodes above a leaf, outermost first.
     public static func ancestors(of index: Int, in tree: LayoutNode) -> [Ancestor] {
         func search(_ node: LayoutNode, _ path: String) -> [Ancestor]? {

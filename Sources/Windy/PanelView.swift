@@ -5,6 +5,8 @@ import WindyCore
 struct PanelView: View {
     @Bindable var model: AppModel
     @Bindable var prefs = Prefs.shared
+    @State private var workspaceName = ""
+    @State private var workspaceError: String?
 
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
@@ -62,6 +64,11 @@ struct PanelView: View {
 
             Divider()
 
+            if let workspaces = model.workspaces {
+                workspaceSection(workspaces)
+                Divider()
+            }
+
             HStack {
                 Button("Settings…") { model.showSettings() }
                 Spacer()
@@ -91,6 +98,53 @@ struct PanelView: View {
             .toggleStyle(.switch)
             .labelsHidden()
         }
+    }
+
+    private func workspaceSection(_ workspaces: Workspaces) -> some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text("Workspaces").font(.caption).foregroundStyle(.secondary)
+            ForEach(workspaces.all, id: \.name) { ws in
+                HStack {
+                    Text(ws.name).lineLimit(1)
+                    Spacer()
+                    Button("Open") {
+                        workspaceError = nil
+                        do {
+                            try workspaces.open(ws.name) { reply in
+                                let missing = ((reply["result"] as? JSON)?["missing"] as? [String]) ?? []
+                                workspaceError = missing.isEmpty ? nil : "Missing: " + missing.joined(separator: ", ")
+                            }
+                        } catch let error as CommandError {
+                            workspaceError = error.message
+                        } catch {}
+                    }
+                    .controlSize(.small)
+                }
+            }
+            HStack {
+                TextField("Save this setup as…", text: $workspaceName)
+                    .textFieldStyle(.roundedBorder).controlSize(.small)
+                    .onSubmit(saveWorkspace)
+                Button("Save", action: saveWorkspace)
+                    .controlSize(.small)
+                    .disabled(workspaceName.trimmingCharacters(in: .whitespaces).isEmpty)
+            }
+            if let workspaceError {
+                Text(workspaceError).font(.caption).foregroundStyle(.orange)
+            }
+        }
+    }
+
+    private func saveWorkspace() {
+        let name = workspaceName.trimmingCharacters(in: .whitespaces)
+        guard !name.isEmpty, let workspaces = model.workspaces else { return }
+        do {
+            try workspaces.saveCurrent(name)
+            workspaceName = ""
+            workspaceError = nil
+        } catch let error as CommandError {
+            workspaceError = error.message
+        } catch {}
     }
 
     private var preview: some View {

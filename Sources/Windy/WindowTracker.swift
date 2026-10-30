@@ -46,6 +46,7 @@ final class WindowTracker {
     var onChange: (() -> Void)?
     var onGeometry: ((CGWindowID) -> Void)?
     var onFocus: (() -> Void)?
+    var onSpaceChange: (() -> Void)?
 
     func start() {
         guard !started else { return }
@@ -77,7 +78,7 @@ final class WindowTracker {
             }
         }
         center.addObserver(forName: NSWorkspace.activeSpaceDidChangeNotification, object: nil, queue: .main) { [weak self] _ in
-            MainActor.assumeIsolated { self?.scanAll() }
+            MainActor.assumeIsolated { self?.onSpaceChange?() }
         }
         for app in NSWorkspace.shared.runningApplications { watch(app, attempt: 0) }
     }
