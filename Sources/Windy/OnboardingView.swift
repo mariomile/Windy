@@ -8,6 +8,7 @@ struct OnboardingView: View {
     var onFinish: () -> Void
     @State private var step = 0
     @State private var trusted = Accessibility.isTrusted
+    @State private var waited = 0
     private let timer = Timer.publish(every: 1, on: .main, in: .common).autoconnect()
 
     var body: some View {
@@ -31,7 +32,10 @@ struct OnboardingView: View {
         }
         .padding(28)
         .frame(width: 460, height: 420)
-        .onReceive(timer) { _ in trusted = Accessibility.isTrusted }
+        .onReceive(timer) { _ in
+            trusted = Accessibility.isTrusted
+            if step == 1, !trusted { waited += 1 }
+        }
     }
 
     private var welcome: some View {
@@ -57,6 +61,14 @@ struct OnboardingView: View {
                 Label(trusted ? "Access granted" : "Waiting for access",
                       systemImage: trusted ? "checkmark.circle.fill" : "hourglass")
                     .foregroundStyle(trusted ? .green : .secondary)
+            }
+            if waited >= 10 {
+                // The switch belongs to the copy of Windy it was turned on for: a different copy
+                // (a new download, a rebuild) shows it on but isn't allowed until it's added again.
+                Text("Switch already on? It may be for another copy of Windy. Select Windy in the list, remove it with −, then come back here and click Open System Settings again.")
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+                Button("Restart Windy", action: Accessibility.relaunch)
             }
             Toggle("Open Windy at login", isOn: $prefs.openAtLogin)
         }

@@ -82,4 +82,13 @@ enum Accessibility {
     static func openSettings() {
         NSWorkspace.shared.open(URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility")!)
     }
+
+    /// Starts a fresh copy once this one has quit, for when macOS only notices the permission on launch.
+    static func relaunch() {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/bin/sh")
+        process.arguments = ["-c", "sleep 1; /usr/bin/open \"$0\"", Bundle.main.bundlePath]
+        try? process.run()
+        NSApp.terminate(nil)
+    }
 }
